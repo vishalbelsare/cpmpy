@@ -17,11 +17,15 @@
         max
         min
         sum
+        abs
 """
-import numpy as np
-from .variables import NDVarArray
-from .core import Expression, Operator
-from .globalconstraints import Minimum, Maximum
+import builtins  # to use the original Python-builtins
+
+from .utils import is_false_cst, is_true_cst, is_any_list
+from .variables import NDVarArray, cpm_array
+from .core import Expression, Operator, BoolVal
+from .globalfunctions import Minimum, Maximum, Abs
+
 
 # Overwriting all/any python built-ins
 # all: listwise 'and'
@@ -34,12 +38,12 @@ def all(iterable):
     if isinstance(iterable, NDVarArray): iterable=iterable.flat # 1D iterator
     collect = [] # logical expressions
     for elem in iterable:
-        if elem is False:
-            return False # no need to create constraint
-        elif elem is True:
+        if is_false_cst(elem):
+            return False  # no need to create constraint
+        elif is_true_cst(elem):
             pass
         elif isinstance(elem, Expression) and elem.is_bool():
-            collect.append( elem )
+            collect.append(elem)
         else:
             raise Exception("Non-Boolean argument '{}' to 'all'".format(elem))
     if len(collect) == 1:
@@ -47,6 +51,7 @@ def all(iterable):
     if len(collect) >= 2:
         return Operator("and", collect)
     return True
+
 
 # any: listwise 'or'
 def any(iterable):
@@ -58,45 +63,85 @@ def any(iterable):
     if isinstance(iterable, NDVarArray): iterable=iterable.flat # 1D iterator
     collect = [] # logical expressions
     for elem in iterable:
-        if elem is True:
+        if is_true_cst(elem):
             return True # no need to create constraint
-        elif elem is False:
+        elif is_false_cst(elem):
             pass
         elif isinstance(elem, Expression) and elem.is_bool():
-            collect.append( elem )
+            collect.append(elem)
         else:
-            raise Exception("Non-Boolean argument '{}' to 'all'".format(elem))
+            raise Exception("Non-Boolean argument '{}' to 'any'".format(elem))
     if len(collect) == 1:
         return collect[0]
     if len(collect) >= 2:
         return Operator("or", collect)
     return False
 
-def max(iterable):
+
+def max(*iterable, **kwargs):
     """
-        max() overwrites python built-in,
-        checks if all constants and computes np.max() in that case
+        max() overwrites the python built-in to support decision variables.
+
+        if iterable does not contain CPMpy expressions, the built-in is called
+        else a Maximum functional global constraint is constructed; no keyword
+          arguments are supported in that case
     """
-    if not any(isinstance(elem, Expression) for elem in iterable):
-        return np.max(iterable)
+    if len(iterable) == 1:
+        iterable = tuple(iterable[0])
+    if not builtins.any(isinstance(elem, Expression) for elem in iterable):
+        return builtins.max(iterable, **kwargs)
+
+    assert len(kwargs)==0, "max over decision variables does not support keyword arguments"
     return Maximum(iterable)
 
-def min(iterable):
+
+def min(*iterable, **kwargs):
     """
-        min() overwrites python built-in,
-        checks if all constants and computes np.min() in that case
+        min() overwrites the python built-in to support decision variables.
+
+        if iterable does not contain CPMpy expressions, the built-in is called
+        else a Minimum functional global constraint is constructed; no keyword
+          arguments are supported in that case
     """
-    if not any(isinstance(elem, Expression) for elem in iterable):
-        return np.min(iterable)
+    if len(iterable) == 1:
+        iterable = tuple(iterable[0])
+    if not builtins.any(isinstance(elem, Expression) for elem in iterable):
+        return builtins.min(iterable, **kwargs)
+
+    assert len(kwargs)==0, "min over decision variables does not support keyword arguments"
     return Minimum(iterable)
 
-def sum(iterable):
+
+def sum(*iterable, **kwargs):
     """
-        sum() overwrites python built-in,
-        checks if all constants and computes np.sum() in that case
-        otherwise, makes a sum Operator directly on `iterable`
+        sum() overwrites the python built-in to support decision variables.
+
+        if iterable does not contain CPMpy expressions, the built-in is called
+        checks if all constants and uses built-in sum() in that case
     """
-    iterable = list(iterable) # Fix generator polling
-    if not any(isinstance(elem, Expression) for elem in iterable):
-        return np.sum(iterable)
+    if len(iterable) == 1:
+        iterable = tuple(iterable[0]) # Fix generator polling
+    if not builtins.any(isinstance(elem, Expression) for elem in iterable):
+        return builtins.sum(iterable, **kwargs)
+
+    assert len(kwargs)==0, "sum over decision variables does not support keyword arguments"
     return Operator("sum", iterable)
+
+
+def abs(element):
+    """
+        abs() overwrites the python built-in to support decision variables.
+
+        if the element given is not a CPMpy expression, the built-in is called
+        else an Absolute functional global constraint is constructed.
+    """
+    if is_any_list(element):  # compat: not allowed by builtins.abs(), but allowed by numpy.abs()
+        return cpm_array([abs(elem) for elem in element])
+
+    if isinstance(element, Expression):
+        # create global
+        return Abs(element)
+    
+    return builtins.abs(element)
+
+    

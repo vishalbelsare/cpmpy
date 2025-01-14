@@ -1,6 +1,14 @@
 #!/usr/bin/env python
+#-*- coding:utf-8 -*-
+##
+## z3.py
+##
 """
     Interface to z3's API
+
+    Requires that the 'z3-solver' python package is installed:
+    
+        $ pip install z3-solver
 
     Z3 is a highly versatile and effective theorem prover from Microsoft.
     Underneath, it is an SMT solver with a wide scala of theory solvers.
@@ -19,15 +27,22 @@
         :nosignatures:
 
         CPM_z3
+
+    ==============
+    Module details
+    ==============
 """
 from .solver_interface import SolverInterface, SolverStatus, ExitStatus
-from ..expressions.core import Expression, Comparison, Operator
-from ..expressions.globalconstraints import GlobalConstraint
-from ..expressions.variables import _BoolVarImpl, NegBoolView, _NumVarImpl, _IntVarImpl
-from ..expressions.python_builtins import min, max,any, all
-from ..expressions.utils import is_num, is_any_list, is_bool
-from ..transformations.get_variables import get_variables
-from ..transformations.flatten_model import flatten_constraint, get_or_make_var
+from ..exceptions import NotSupportedError
+from ..expressions.core import Expression, Comparison, Operator, BoolVal
+from ..expressions.globalconstraints import GlobalConstraint, DirectConstraint
+from ..expressions.globalfunctions import GlobalFunction
+from ..expressions.variables import _BoolVarImpl, NegBoolView, _NumVarImpl, _IntVarImpl, intvar
+from ..expressions.utils import is_num, is_any_list, is_bool, is_int, is_boolexpr, eval_comparison
+from ..transformations.decompose_global import decompose_in_tree
+from ..transformations.normalize import toplevel_list
+from ..transformations.safening import no_partial_functions
+
 
 class CPM_z3(SolverInterface):
     """
@@ -40,7 +55,9 @@ class CPM_z3(SolverInterface):
     https://github.com/Z3Prover/z3#python
 
     Creates the following attributes (see parent constructor for more):
-    z3_solver: object, z3's Solver() object
+        - z3_solver: object, z3's Solver() object
+
+    The `DirectConstraint`, when used, calls a function in the `z3` namespace and `z3_solver.add()`'s the result.
     """
 
     @staticmethod
@@ -49,8 +66,10 @@ class CPM_z3(SolverInterface):
         try:
             import z3
             return True
-        except ImportError as e:
+        except ModuleNotFoundError:
             return False
+        except Exception as e:
+            raise e
 
 
     def __init__(self, cpm_model=None, subsolver="sat"):
@@ -62,12 +81,15 @@ class CPM_z3(SolverInterface):
         - subsolver: None
         """
         if not self.supported():
-            raise Exception("CPM_z3: Install the python package 'z3-solver'")
+            raise Exception("CPM_z3: Install the python package 'z3-solver' to use this solver interface.")
 
         import z3
 
         if subsolver is None:
-            subsolver = "sat"
+            if cpm_model and cpm_model.has_objective():
+                subsolver = "opt"
+            else:
+                subsolver = "sat"
         assert "sat" in subsolver or "opt" in subsolver, "Z3 only has a satisfaction or optimization sub-solver."
 
         # initialise the native solver object
@@ -78,6 +100,13 @@ class CPM_z3(SolverInterface):
 
         # initialise everything else and post the constraints/objective
         super().__init__(name="z3", cpm_model=cpm_model)
+
+    @property
+    def native_model(self):
+        """
+            Returns the solver's underlying native model (for direct solver access).
+        """
+        return self.z3_solver
 
 
     def solve(self, time_limit=None, assumptions=[], **kwargs):
@@ -108,6 +137,9 @@ class CPM_z3(SolverInterface):
             ```
         """
         import z3
+
+        # ensure all vars are known to solver
+        self.solver_vars(list(self.user_vars))
 
         if time_limit is not None:
             # z3 expects milliseconds in int
@@ -161,14 +193,13 @@ class CPM_z3(SolverInterface):
                     cpm_var._value = sol[sol_var].as_long()
 
             # translate objective, for optimisation problems only
-            if isinstance(self.z3_solver, z3.Optimize) and \
-                    len(self.z3_solver.objectives()) != 0:
+            if self.has_objective():
                 obj = self.z3_solver.objectives()[0]
-                self.objective_value_ = sol.evaluate(obj)
+                self.objective_value_ = sol.evaluate(obj).as_long()
 
-        else:
+        else:  # clear values of variables
             for cpm_var in self.user_vars:
-                cpm_var._value = None # XXX, maybe all solvers should do this...
+                cpm_var._value = None
 
         return has_sol
 
@@ -206,7 +237,10 @@ class CPM_z3(SolverInterface):
         return self._varmap[cpm_var]
 
 
-    # if TEMPLATE does not support objective functions, you can delete objective()/_make_numexpr()
+    def has_objective(self):
+        import z3
+        return isinstance(self.z3_solver, z3.Optimize) and len(self.z3_solver.objectives()) != 0
+
     def objective(self, expr, minimize=True):
         """
             Post the given expression to the solver as objective to minimize/maximize
@@ -218,50 +252,71 @@ class CPM_z3(SolverInterface):
         """
         import z3
         # objective can be a nested expression for z3
-        assert isinstance(self.z3_solver, z3.Optimize), "Use the z3 optimizer for optimization problems"
+        if not isinstance(self.z3_solver, z3.Optimize):
+            raise NotSupportedError("Use the z3 optimizer for optimization problems")
+
+        if isinstance(expr, GlobalFunction): # not supported by Z3
+            obj_var = intvar(*expr.get_bounds())
+            self += expr == obj_var
+            expr = obj_var
+
         obj = self._z3_expr(expr)
         if minimize:
             self.z3_solver.minimize(obj)
         else:
             self.z3_solver.maximize(obj)
 
-    def __add__(self, cpm_con):
-        """
-        Post a (list of) CPMpy constraints(=expressions) to the solver
 
-        Note that we don't store the constraints in a cpm_model,
-        we first transform the constraints into primitive constraints,
-        then post those primitive constraints directly to the native solver
-
-        :param cpm_con CPMpy constraint, or list thereof
-        :type cpm_con (list of) Expression(s)
+    def transform(self, cpm_expr):
         """
-        # Z3 supports nested expressions, so no transformations needed
-        # that also means we don't need to extract user variables here
-        # we store them directly in `solver_var()` itself.
-        self._post_constraint(cpm_con)
+            Transform arbitrary CPMpy expressions to constraints the solver supports
+
+            Implemented through chaining multiple solver-independent **transformation functions** from
+            the `cpmpy/transformations/` directory.
+
+            See the 'Adding a new solver' docs on readthedocs for more information.
+
+        :param cpm_expr: CPMpy expression, or list thereof
+        :type cpm_expr: Expression or list of Expression
+
+        :return: list of Expression
+        """
+
+        cpm_cons = toplevel_list(cpm_expr)
+        cpm_cons = no_partial_functions(cpm_cons, safen_toplevel={"div", "mod"})
+        supported = {"alldifferent", "xor", "ite"}  # z3 accepts these reified too
+        cpm_cons = decompose_in_tree(cpm_cons, supported, supported)
+        return cpm_cons
+
+    def __add__(self, cpm_expr):
+        """
+            Z3 supports nested expressions so translate expression tree and post to solver API directly
+
+            Any CPMpy expression given is immediately transformed (through `transform()`)
+            and then posted to the solver in this function.
+
+            This can raise 'NotImplementedError' for any constraint not supported after transformation
+
+            The variables used in expressions given to add are stored as 'user variables'. Those are the only ones
+            the user knows and cares about (and will be populated with a value after solve). All other variables
+            are auxiliary variables created by transformations.
+
+        :param cpm_expr: CPMpy expression, or list thereof
+        :type cpm_expr: Expression or list of Expression
+
+        :return: self
+        """
+        # all variables are user variables, handled in `solver_var()`
+
+        # transform and post the constraints
+        for cpm_con in self.transform(cpm_expr):
+            # translate each expression tree, then post straight away
+            z3_con = self._z3_expr(cpm_con)
+            self.z3_solver.add(z3_con)
 
         return self
 
-    def _post_constraint(self, cpm_expr):
-        """
-            Post a primitive CPMpy constraint to the native solver API
-
-            Z3 supports nested expressions so translate expression tree and post to solver API directly
-        """
-        if is_any_list(cpm_expr):
-            for con in cpm_expr:
-                self._post_constraint(con)
-
-        # translate each expression tree, then post straight away
-        z3_cons = self._z3_expr(cpm_expr)
-        if is_any_list(z3_cons):
-            for z3_con in z3_cons:
-                self.z3_solver.add(z3_con)
-        else:
-            return self.z3_solver.add(z3_cons)
-
-    def _z3_expr(self, cpm_con, reify=False):
+    def _z3_expr(self, cpm_con):
         """
             Z3 supports nested expressions,
             so we recursively translate our expressions to theirs.
@@ -275,23 +330,32 @@ class CPM_z3(SolverInterface):
             # translate numpy to python native
             if is_bool(cpm_con):
                 return bool(cpm_con)
-            return int(cpm_con)
+            elif is_int(cpm_con):
+                return z3.IntVal(int(cpm_con))
+            return float(cpm_con)
 
         elif is_any_list(cpm_con):
+            # arguments can be lists
             return [self._z3_expr(con) for con in cpm_con]
-            
+
+        elif isinstance(cpm_con, BoolVal):
+            return cpm_con.args[0]
+
         elif isinstance(cpm_con, _NumVarImpl):
             return self.solver_var(cpm_con)
 
         # Operators: base (bool), lhs=numexpr, lhs|rhs=boolexpr (reified ->)
         elif isinstance(cpm_con, Operator):
-            # 'and'/n, 'or'/n, 'xor'/n, '->'/2
+            arity, _ = Operator.allowed[cpm_con.name]
+            # 'and'/n, 'or'/n, '->'/2
             if cpm_con.name == 'and':
                 return z3.And(self._z3_expr(cpm_con.args))
             elif cpm_con.name == 'or':
                 return z3.Or(self._z3_expr(cpm_con.args))
             elif cpm_con.name == '->':
-                return z3.Implies(*self._z3_expr(cpm_con.args, reify=True))
+                return z3.Implies(*self._z3_expr(cpm_con.args))
+            elif cpm_con.name == 'not':
+                return z3.Not(self._z3_expr(cpm_con.args[0]))
 
             # 'sum'/n, 'wsum'/2
             elif cpm_con.name == 'sum':
@@ -301,114 +365,91 @@ class CPM_z3(SolverInterface):
                 x = self._z3_expr(cpm_con.args[1])
                 return z3.Sum([wi*xi for wi,xi in zip(w,x)])
 
-            # 'sub'/2, 'mul'/2, 'div'/2, 'pow'/2, 'mod'/2
-            elif cpm_con.name == 'sub':
-                lhs , rhs = self._z3_expr(cpm_con.args)
-                return lhs - rhs
-            elif cpm_con.name == "mul":
+            # 'sub'/2, 'mul'/2, 'div'/2, 'pow'/2, 'm2od'/2
+            elif arity == 2 or cpm_con.name == "mul":
                 assert len(cpm_con.args) == 2, "Currently only support multiplication with 2 vars"
-                lhs , rhs = self._z3_expr(cpm_con.args)
-                return lhs * rhs
-            elif cpm_con.name == "div":
-                lhs , rhs = self._z3_expr(cpm_con.args)
-                return lhs / rhs
-            elif cpm_con.name == "pow":
-                lhs , rhs = self._z3_expr(cpm_con.args)
-                return lhs ** rhs
-            elif cpm_con.name == "mod":
-                lhs , rhs = self._z3_expr(cpm_con.args)
-                return lhs % rhs
+                x, y = self._z3_expr(cpm_con.args)
+                if isinstance(x, z3.BoolRef):
+                    x = z3.If(x, 1, 0)
+                if isinstance(y, z3.BoolRef):
+                    y = z3.If(y, 1, 0)
+
+                if cpm_con.name == 'sub':
+                    return x - y
+                elif cpm_con.name == "mul":
+                    return x * y
+                elif cpm_con.name == "div":
+                    return x / y
+                elif cpm_con.name == "pow":
+                    if not is_num(cpm_con.args[1]):
+                        # tricky in Z3 not all power constraints are decidable
+                        # solver will return 'unknown', even if theory is satisfiable.
+                        # https://stackoverflow.com/questions/70289335/power-and-logarithm-in-z3
+                        # raise error to be consistent with other solvers
+                        raise NotSupportedError(f"Z3 only supports power constraint with constant exponent, got {cpm_con}")
+                    return x ** y
+                elif cpm_con.name == "mod":
+                    return x % y
 
             # '-'/1
             elif cpm_con.name == "-":
+                if is_boolexpr(cpm_con.args[0]):
+                    return -z3.If(self._z3_expr(cpm_con.args[0]), 1, 0)
                 return -self._z3_expr(cpm_con.args[0])
 
             else:
-                raise NotImplementedError(f"Operator {cpm_con} not (yet) implemented for Z3, please report on github if you need it")
+                raise NotImplementedError(f"Operator {cpm_con} not (yet) implemented for Z3, "
+                                          f"please report on github if you need it")
 
         # Comparisons (just translate the subexpressions and re-post)
         elif isinstance(cpm_con, Comparison):
-
             lhs, rhs = cpm_con.args
 
-            # 'abs'/1
-            if isinstance(rhs, Operator) and rhs.name == "abs":
-                arg = rhs.args[0]
-                return self._z3_expr(Comparison(cpm_con.name, lhs, max([arg, -arg])))
-            if isinstance(lhs, Operator) and lhs.name == "abs":
-                arg = lhs.args[0]
-                return self._z3_expr(Comparison(cpm_con.name, max([arg, -arg]), rhs))
+            lhs_bexpr = is_boolexpr(lhs)
+            rhs_bexpr = is_boolexpr(rhs)
 
-            if isinstance(lhs, GlobalConstraint) and lhs.name == "element":
-                arr, idx = lhs.args
-                return self._z3_expr(all([(idx == i).implies(Comparison(cpm_con.name, arr[i], rhs)) for i in range(len(arr))]))
-            if isinstance(rhs, GlobalConstraint) and rhs.name == "element":
-                arr, idx = rhs.args
-                return self._z3_expr(all([(idx == i).implies(Comparison(cpm_con.name, lhs, arr[i])) for i in range(len(arr))]))
-
-            if cpm_con.name == "==":
-                if isinstance(lhs, GlobalConstraint) and lhs.name == "max":
-                    if reify:
-                        raise NotImplementedError(f"Reification of {cpm_con} not supported yet")
-                    return z3.And(self._z3_expr(any(a == rhs for a in lhs.args)),
-                                  self._z3_expr(all([a <= rhs for a in lhs.args])))
-                if isinstance(rhs, GlobalConstraint) and rhs.name == "max":
-                    if reify:
-                        raise NotImplementedError(f"Reification of {cpm_con} not supported yet")
-                    return z3.And(self._z3_expr(any(lhs == a for a in rhs.args)),
-                                  self._z3_expr(all([lhs >= a for a in rhs.args])))
-                if isinstance(lhs, GlobalConstraint) and lhs.name == "min":
-                    if reify:
-                        raise NotImplementedError(f"Reification of {cpm_con} not supported yet")
-                    return z3.And(self._z3_expr(any(a == rhs for a in lhs.args)),
-                                  self._z3_expr(all([a >= rhs for a in lhs.args])))
-                if isinstance(rhs, GlobalConstraint) and rhs.name == "min":
-                    if reify:
-                        raise NotImplementedError(f"Reification of {cpm_con} not supported yet")
-                    return z3.And(self._z3_expr(any(lhs == a for a in rhs.args)),
-                                  self._z3_expr(all([lhs <= a for a in rhs.args])))
-
-                lhs, rhs = self._z3_expr(cpm_con.args)
-                return (lhs == rhs)
-
-
-            if isinstance(lhs, GlobalConstraint) and lhs.name in ("min", "max"):
-                new_var, cons = get_or_make_var(lhs)
-                return z3.And(self._z3_expr(all(cons)), self._z3_expr(Comparison(cpm_con.name, new_var, rhs)))
-            if isinstance(rhs, GlobalConstraint) and rhs.name in ("min", "max"):
-                new_var, cons = get_or_make_var(rhs)
-                return z3.And(self._z3_expr(all(cons)), self._z3_expr(Comparison(cpm_con.name, lhs, new_var)))
-
-            # other comparisons
             lhs, rhs = self._z3_expr(cpm_con.args)
+
+            if cpm_con.name == "==" or cpm_con.name == "!=":
+                # z3 supports bool <-> bool comparison but not bool <-> arith
+                if lhs_bexpr and not rhs_bexpr:
+                    # upcast lhs to integer
+                    lhs = z3.If(lhs, 1, 0)
+                elif rhs_bexpr and not lhs_bexpr:
+                    # upcase rhs to integer
+                    rhs = z3.If(rhs, 1, 0)
+            else:
+                # other comparisons are not supported on boolexpr
+                if lhs_bexpr: # upcast lhs
+                    lhs = z3.If(lhs, 1, 0)
+                if rhs_bexpr: # upcase rhs
+                    rhs = z3.If(rhs, 1, 0)
+
             # post the comparison
-            if cpm_con.name == '<=':
-                return (lhs <= rhs)
-            elif cpm_con.name == '<':
-                return (lhs < rhs)
-            elif cpm_con.name == '>=':
-                return (lhs >= rhs)
-            elif cpm_con.name == '>':
-                return (lhs > rhs)
-            elif cpm_con.name == '!=':
-                return (lhs != rhs)
-
-
-        # TODO:
-        # table
+            return eval_comparison(cpm_con.name, lhs, rhs)
 
         # rest: base (Boolean) global constraints
-        elif cpm_con.name == 'xor':
-            z3_args = self._z3_expr(cpm_con.args)
-            z3_cons = z3.Xor(z3_args[0], z3_args[1])
-            for a in z3_args[2:]:
-                z3_cons = z3.Xor(z3_cons, a)
-            return z3_cons
-        elif cpm_con.name == 'alldifferent':
-            return z3.Distinct(self._z3_expr(cpm_con.args))
+        elif isinstance(cpm_con, GlobalConstraint):
+            # TODO:
+            # table
 
-        # global constraints
-        return self._z3_expr(all(cpm_con.decompose()))
+            if cpm_con.name == 'alldifferent':
+                return z3.Distinct(self._z3_expr(cpm_con.args))
+            elif cpm_con.name == 'xor':
+                z3_args = self._z3_expr(cpm_con.args)
+                z3_cons = z3.Xor(z3_args[0], z3_args[1])
+                for a in z3_args[2:]:
+                    z3_cons = z3.Xor(z3_cons, a)
+                return z3_cons
+            elif cpm_con.name == 'ite':
+                return z3.If(self._z3_expr(cpm_con.args[0]), self._z3_expr(cpm_con.args[1]),
+                             self._z3_expr(cpm_con.args[2]))
+
+            raise ValueError(f"Global constraint {cpm_con} should be decomposed already, please report on github.")
+
+        # a direct constraint, make with z3 (will be posted to it by calling function)
+        elif isinstance(cpm_con, DirectConstraint):
+            return cpm_con.callSolver(self, z3)
 
         raise NotImplementedError("Z3: constraint not (yet) supported", cpm_con)
 
@@ -427,3 +468,6 @@ class CPM_z3(SolverInterface):
         assert (len(self.assumption_dict) > 0), "Assumptions must be set using s.solve(assumptions=[...])"
 
         return [self.assumption_dict[z3_var] for z3_var in self.z3_solver.unsat_core()]
+
+
+

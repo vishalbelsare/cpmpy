@@ -24,9 +24,18 @@
 
     Boolean and Integer decision variables are the key elements of a CP model.
 
-    All variables in CPMpy are n-dimensional array objects and have defined dimensions. Following the numpy library, the dimension sizes of an n-dimenionsal array is called its __shape__. In CPMpy all variables are considered an array with a given shape. For 'single' variables the shape is '1'. For an array of length `n` the shape is 'n'. An `n*m` matrix has shape (n,m), and tensors with more than 2 dimensions are all supported too. For the implementation of this, CPMpy builts on numpy's n-dimensional ndarray and inherits many of its benefits (vectorized operators and advanced indexing).
+    All variables in CPMpy are n-dimensional array objects and have defined dimensions. 
+    Following the numpy library, the dimension sizes of an n-dimenionsal array is called its __shape__. 
+    In CPMpy all variables are considered an array with a given shape. For 'single' variables the shape 
+    is '1'. For an array of length `n` the shape is 'n'. An `n*m` matrix has shape (n,m), and tensors 
+    with more than 2 dimensions are all supported too. For the implementation of this, 
+    CPMpy builts on numpy's n-dimensional ndarray and inherits many of its benefits 
+    (vectorized operators and advanced indexing).
 
-    This module contains the cornerstone `boolvar()` and `intvar()` functions, which create (numpy arrays of) variables. There is also a helper function `cpm_array` for wrapping standard numpy arrays so they can be indexed by a variable. Apart from these 3 functions, none of the classes in this module should be directly created; they are created by these 3 helper functions.
+    This module contains the cornerstone `boolvar()` and `intvar()` functions, which create (numpy arrays of) 
+    variables. There is also a helper function `cpm_array()` for wrapping standard numpy arrays so they can be 
+    indexed by a variable. Apart from these 3 functions, none of the classes in this module should be directly 
+    instantiated; they are created by these 3 helper functions.
 
 
     ===============
@@ -46,31 +55,40 @@
     Module details
     ==============
 """
-
+import math
 from collections.abc import Iterable
 import warnings # for deprecation warning
+from functools import reduce
+
 import numpy as np
+import cpmpy as cp  # to avoid circular import
 from .core import Expression, Operator
-from .utils import is_num, is_int, flatlist
+from .utils import is_num, is_int, flatlist, is_boolexpr, is_true_cst, is_false_cst, get_bounds
 
 
 def BoolVar(shape=1, name=None):
     warnings.warn("Deprecated, use boolvar() instead, will be removed in stable version", DeprecationWarning)
     return boolvar(shape=shape, name=name)
+
+
 def boolvar(shape=1, name=None):
     """
     Boolean decision variables will take either the value `True` or `False`.
     
     Arguments:
-    shape -- the shape of the n-dimensional array of variables (int, default: 1)
-    name -- name to give to the variables (string, default: None)
+    shape -- the shape of the n-dimensional array of variables (int or tuple of ints, default: 1)
+    name -- name to give to the variables (string or list/tuple/array of string, default: None)
 
     If name is None then a name 'BV<unique number>' will be assigned to it.
+    If name is a string, then assign it as the suffix of variable names.
+    If name is a list/tuple/array of string, then assign them as the variable names accordingly.
 
     If shape is different from 1, then each element of the array will have the location
     of this specific variable in the array append to its name.
 
-    For example, `print(boolvar(shape=3, name="x"))` will print `[x[0],x[1],x[2]]`
+    For example,
+    - `print(boolvar(shape=3, name="x"))` will print `[x[0], x[1], x[2]]`
+    - `print(boolvar(shape=3, name=list("xyz"))` will print `[x, y, z]`
 
 
     The following examples show how to create Boolean variables of different shapes:
@@ -91,13 +109,15 @@ def boolvar(shape=1, name=None):
             # note that with Python's unpacking, you can assign them
             # to intermediate variables. This allows for fine-grained use of variables when
             # defining the constraints of the model
-            e,x,a,m,p,l = boolvar(shape=6)
+            e, x, a, m, p, l = boolvar(shape=6, name=list("exampl"))
 
     - the creation of a matrix or higher-order tensor of Boolean variables. 
         .. code-block:: python
 
             # creation of a 9x9 matrix of Boolean variables:
-            matrix = boolvar(shape=(9,9), name="matrix")
+            matrix = boolvar(shape=(9, 9), name="matrix")
+            # creation of a 2x2 matrix of Boolean variables, and give a name for each element:
+            matrix2 = boolvar(shape=(2, 2), name=[['a', 'b'], ['c', 'd']])
 
             # creation of a __tensor of Boolean variables where (3, 8, 7) reflects
             # the dimensions of the tensor, a matrix of multiple-dimensions.
@@ -108,32 +128,41 @@ def boolvar(shape=1, name=None):
         raise NullShapeError(shape)
     if shape == 1:
         return _BoolVarImpl(name=name)
-    
-    # create base data
-    data = np.array([_BoolVarImpl(name=_genname(name, idxs)) for idxs in np.ndindex(shape)]) # repeat new instances
+
+    # collect the `names` of each individual decision variable
+    names = _gen_var_names(name, shape)
+
+    # create np.array 'data' representation of the decision variables
+    data = np.array([_BoolVarImpl(name=n) for n in names])
     # insert into custom ndarray
-    return NDVarArray(shape, dtype=object, buffer=data)
+    r = NDVarArray(shape, dtype=object, buffer=data)
+    r._has_subexpr = False # A bit ugly (acces to private field) but otherwise np.ndarray constructor complains if we pass it as an argument to NDVarArray
+    return r
 
 
 def IntVar(lb, ub, shape=1, name=None):
-    warnings.warn("Deprecated, use boolvar() instead, will be removed in stable version", DeprecationWarning)
+    warnings.warn("Deprecated, use intvar() instead, will be removed in stable version", DeprecationWarning)
     return intvar(lb, ub, shape=shape, name=name)
+
+
 def intvar(lb, ub, shape=1, name=None):
     """
-    Integer decision variables are constructed by specifying the lowest (lb)
+    Integer decision variables are constructed by specifying the lowest (lb) value
     the decision variable can take, as well as the highest value (ub).
 
     Arguments:
     lb -- lower bound on the values the variable can take (int)
     ub -- upper bound on the values the variable can take (int)
-    shape -- the shape of the n-dimensional array of variables (int, default: 1)
-    name -- name to give to the variables (string, default: None)
+    shape -- the shape of the n-dimensional array of variables (int or tuple of ints, default: 1)
+    name -- name to give to the variables (string or list/tuple/array of string, default: None)
 
     The range of values between lb..ub is called the __domain__ of the integer variable.
     All variables in an array start from the same domain.
     Specific values in the domain of individual variables can be forbidden with constraints.
 
     If name is None then a name 'IV<unique number>' will be assigned to it.
+    If name is a string, then assign it as the suffix of variable names.
+    If name is a list/tuple/array of string, then assign them as the variable names accordingly.
 
     If shape is different from 1, then each element of the array will have the location
     of this specific variable in the array append to its name.
@@ -155,27 +184,34 @@ def intvar(lb, ub, shape=1, name=None):
             x = intvar(3, 8, shape=5, name="x")
 
             # Python's unpacking can assign multiple intermediate variables at once
-            e,x,a,m,p,l = intvar(3, 8, shape=5)
+            e, x, a, m, p, l = intvar(3, 8, shape=6, name=list("exampl"))
 
     - Creation of a 4D-array/tensor (of dimensions 100 x 100 x 100 x 100) of integer variables.
         .. code-block:: python
 
-            arrx = intvar(3, 8, shape=(100, 100, 100, 100), name="arrx")
+            arrx s= intvar(3, 8, shape=(100, 100, 100, 100), name="arrx")
 
     """
     if shape == 0 or shape is None:
         raise NullShapeError(shape)
     if shape == 1:
-        return _IntVarImpl(lb,ub, name=name)
+        return _IntVarImpl(lb, ub, name=name)
 
-    # create base data
-    data = np.array([_IntVarImpl(lb,ub, name=_genname(name, idxs)) for idxs in np.ndindex(shape)]) # repeat new instances
+    # collect the `names` of each individual decision variable
+    names = _gen_var_names(name, shape)
+
+    # create np.array 'data' representation of the decision variables
+    data = np.array([_IntVarImpl(lb, ub, name=n) for n in names]) # repeat new instances
     # insert into custom ndarray
-    return NDVarArray(shape, dtype=object, buffer=data)
+    r = NDVarArray(shape, dtype=object, buffer=data)
+    r._has_subexpr = False # A bit ugly (acces to private field) but otherwise np.ndarray constructor complains if we pass it as an argument to NDVarArray
+    return r
 
 def cparray(arr):
-    warnings.warn("Deprecated, use boolvar() instead, will be removed in stable version", DeprecationWarning)
+    warnings.warn("Deprecated, use cpm_array() instead, will be removed in stable version", DeprecationWarning)
     return cpm_array(arr)
+
+
 def cpm_array(arr):
     """
     N-dimensional wrapper, to wrap standard numpy arrays or lists.
@@ -190,9 +226,9 @@ def cpm_array(arr):
 
         # Transforming a given numpy-array **m** into a cparray
 
-        iv1,iv2 = intvar(0,9, shape=2)
+        iv1, iv2 = intvar(0, 9, shape=2)
 
-        data = [1,2,3,4]
+        data = [1, 2, 3, 4]
         data = cpm_array(data)
 
         Model([ data[iv1] == iv2 ])
@@ -201,10 +237,14 @@ def cpm_array(arr):
     """
     if not isinstance(arr, np.ndarray):
         arr = np.array(arr)
-    return NDVarArray(shape=arr.shape, dtype=arr.dtype, buffer=arr)
+    order = 'F' if arr.flags['F_CONTIGUOUS'] else 'C'
+    return NDVarArray(shape=arr.shape, dtype=arr.dtype, buffer=arr, order=order)
 
 
 class NullShapeError(Exception):
+    """
+    Error returned when providing an empty or size 0 shape for numpy arrays of variables
+    """
     def __init__(self, shape, message="Shape should be non-zero"):
         self.shape = shape
         self.message = message
@@ -212,6 +252,7 @@ class NullShapeError(Exception):
 
     def __str__(self) -> str:
         return f'{self.shape}: {self.message}'
+
 
 class _NumVarImpl(Expression):
     """
@@ -227,6 +268,12 @@ class _NumVarImpl(Expression):
         self.name = name
         self._value = None
 
+    def has_subexpr(self):
+        """Does it contains nested Expressions?
+           Is of importance when deciding whether transformation/decomposition is needed.
+        """
+        return False
+
     def is_bool(self):
         """ is it a Boolean (return type) Operator?
         """
@@ -238,34 +285,34 @@ class _NumVarImpl(Expression):
         """
         return self._value
 
+    def get_bounds(self):
+        """ the lower and upper bounds"""
+        return self.lb, self.ub
+
     def clear(self):
         """ clear the value obtained from the last solve call
         """
         self._value = None
-    
+
     def __repr__(self):
         return self.name
 
     # for sets/dicts. Because names are unique, so is the str repr
     def __hash__(self):
-        return hash(str(self))
+        return hash(self.name)
 
-    def deepcopy(self, memodict={}):
-        copied = type(self)(self.lb, self.ub, self.name)
-        copied._value = self.value()
-        return copied
 
 class _IntVarImpl(_NumVarImpl):
     """
-    **Integer** constraint variable with given lowerbound and upperbound.
+    **Integer** variable with given lowerbound and upperbound.
 
     Do not create this object directly, use `intvar()` instead
     """
     counter = 0
 
     def __init__(self, lb, ub, name=None):
-        assert is_int(lb), "IntVar lowerbound must be integer {} {}".format(type(lb),lb)
-        assert is_int(ub), "IntVar upperbound must be integer {} {}".format(type(ub),ub)
+        assert is_int(lb), "IntVar lowerbound must be integer {} {}".format(type(lb), lb)
+        assert is_int(ub), "IntVar upperbound must be integer {} {}".format(type(ub), ub)
 
         if name is None:
             name = "IV{}".format(_IntVarImpl.counter)
@@ -280,9 +327,10 @@ class _IntVarImpl(_NumVarImpl):
             return self
         return super().__abs__()
 
+
 class _BoolVarImpl(_IntVarImpl):
     """
-    **Boolean** constraint variable with given lowerbound and upperbound.
+    **Boolean** variable with given lowerbound and upperbound.
 
     Do not create this object directly, use `boolvar()` instead
     """
@@ -296,7 +344,6 @@ class _BoolVarImpl(_IntVarImpl):
             name = "BV{}".format(_BoolVarImpl.counter)
             _BoolVarImpl.counter = _BoolVarImpl.counter + 1 # static counter
         _IntVarImpl.__init__(self, lb, ub, name=name)
-        
 
     def is_bool(self):
         """ is it a Boolean (return type) Operator?
@@ -306,37 +353,14 @@ class _BoolVarImpl(_IntVarImpl):
     def __invert__(self):
         return NegBoolView(self)
 
-    def __eq__(self, other):
-        # (BV == 1) <-> BV
-        # if other == 1: XXX: dangerous because "=="" is overloaded 
-        if (is_int(other) and other == 1) or \
-                other is True or \
-                other is np.bool_(True):
-            return self
-        if (is_int(other) and other == 0) or \
-                other is False or \
-                other is np.bool_(False):
-            return ~self
-        return super().__eq__(other)
-    def __ne__(self, other):
-        # (BV == 0) <-> BV
-        # if other == 1: XXX: dangerous because "=="" is overloaded 
-        if (is_int(other) and other == 1) or \
-                other is True or \
-                other is np.bool_(True):
-            return ~self
-        if (is_int(other) and other == 0) or \
-                other is False or \
-                other is np.bool_(False):
-            return self
-        return super().__ne__(other)
-
     def __abs__(self):
         return self
 
     # when redefining __eq__, must redefine custom__hash__
     # https://stackoverflow.com/questions/53518981/inheritance-hash-sets-to-none-in-a-subclass
-    def __hash__(self): return super().__hash__()
+    def __hash__(self):
+        return hash(self.name)
+
 
 class NegBoolView(_BoolVarImpl):
     """
@@ -349,15 +373,23 @@ class NegBoolView(_BoolVarImpl):
     def __init__(self, bv):
         #assert(isinstance(bv, _BoolVarImpl))
         self._bv = bv
+        # as it is always created using the ~ operator (only available for _BoolVarImpl)
+        # it already comply with the asserts of the __init__ of _BoolVarImpl and can use 
+        # __init__ from _IntVarImpl
         _IntVarImpl.__init__(self, 1-bv.ub, 1-bv.lb, name=str(self))
 
     def value(self):
+        """ the negation of the value obtained in the last solve call by the viewed variable
+            (or 'None')
+        """
         v = self._bv.value()
         if v is None:
             return None
-        return (not v)
+        return not v
 
     def clear(self):
+        """ clear, for the viewed variable, the value obtained from the last solve call
+        """
         self._bv.clear()
 
     def __repr__(self):
@@ -366,22 +398,33 @@ class NegBoolView(_BoolVarImpl):
     def __invert__(self):
         return self._bv
 
-    def deepcopy(self, memodict={}):
-        return NegBoolView(self._bv.deepcopy(memodict))
-
 
 # subclass numericexpression for operators (first), ndarray for all the rest
-class NDVarArray(Expression, np.ndarray):
+class NDVarArray(np.ndarray, Expression):
     """
     N-dimensional numpy array of variables.
 
     Do not create this object directly, use one of the functions in this module
     """
     def __init__(self, shape, **kwargs):
+        # bit ugly, but np.int and np.bool do not play well with > overloading
+        if np.issubdtype(self.dtype, np.integer):
+            self.astype(int)
+        elif np.issubdtype(self.dtype, np.bool_):
+            self.astype(bool)
+
         # TODO: global name?
         # this is nice and sneaky, 'self' is the list_of_arguments!
         Expression.__init__(self, "NDVarArray", self)
-        # somehow, no need to call ndarray constructor
+        # no need to call ndarray __init__ method as specified in the np.ndarray documentation:
+        # "No ``__init__`` method is needed because the array is fully initialized
+        #         after the ``__new__`` method."
+
+    @property
+    def args(self):
+        """ The constructor for NDVarArray never gets called, so _args is never initialised
+        """
+        return self # we can just return self
 
     def is_bool(self):
         """ is it a Boolean (return type) Operator?
@@ -389,71 +432,175 @@ class NDVarArray(Expression, np.ndarray):
         return False
 
     def value(self):
+        """ the values, for each of the stored variables, obtained in the last solve call
+            (or 'None')
+        """
         return np.reshape([x.value() for x in self], self.shape)
 
-    # clear the currently stored values
     def clear(self):
+        """ clear, for each of the stored variables, the value obtained from the last solve call
+        """
         for e in self.flat:
             e.clear()
 
-    def deepcopy(self, memodict={}):
-        copied = [arg.deepcopy(memodict) if isinstance(arg, Expression) else arg for arg in self]
-        return cpm_array(copied)
-    
     def __repr__(self):
         """
             some ways in which np creates this object does not call
             the constructor, so the Expression does not have 'args'
             set..
         """
-        if not hasattr(self, "args"):
+        if not hasattr(self, "_args"):
             self.name = "NDVarArray"
-            self.args = self
+            self.update_args(self)
         return super().__repr__()
 
     def __getitem__(self, index):
-        from .globalconstraints import Element # here to avoid circular
         # array access, check if variables are used in the indexing
 
         # index is single expression: direct element
         if isinstance(index, Expression):
-            return Element(self, index)
+            return cp.Element(self, index)
 
-        # index is array/tuple with at least one expr in it:
-        # index non-expr part, and create element on expr part
-        if isinstance(index, tuple) and \
-           any(isinstance(el, Expression) for el in index):
-            index_rest = list(index) # mutable view
-            var = [] # collector of variables
-            for i in range(len(index)):
-                if isinstance(index[i], Expression):
-                    index_rest[i] = Ellipsis # selects all remaining dimensions
-                    var.append(index[i])
-            assert (len(var)==1), "variable indexing (element) only supported with 1 variable at this moment"
-            # single var, so flatten rest array
-            array_rest = self[tuple(index_rest)] # non-var array selection
-            return Element(array_rest, var[0])
+        # multi-dimensional index
+        if isinstance(index, tuple) and any(isinstance(el, Expression) for el in index):
 
-        ret = super().__getitem__(index)
-        # this is a bit ugly,
-        # but np.int and np.bool do not play well with > overloading
-        if isinstance(ret, np.integer):
-            return int(ret)
-        elif isinstance(ret, np.bool_):
-            return bool(ret)
-        return ret
+            if len(index) != self.ndim:
+                raise NotImplementedError("CPMpy does not support returning an array from an Element constraint. Provide an index for each dimension. If you really need this, please report on github.")
+
+            # find dimension of expression in index
+            expr_dim = [dim for dim,idx in enumerate(index) if isinstance(idx, Expression)]
+            if len(expr_dim) == 1: # optimization, only 1 expression, reshape to 1d-element
+                # TODO can we do the same for more than one Expression? Not sure...
+                index  = list(index)
+                index += [index.pop(expr_dim[0])]
+
+                arr = np.moveaxis(self, expr_dim[0], -1)
+                return cp.Element(arr[index[:-1]], index[-1])
+
+
+            arr = self[tuple(index[:expr_dim[0]])] # select remaining dimensions
+            index = index[expr_dim[0]:]
+
+            # calculate index for flat array
+            flat_index = index[-1]
+            for dim, idx in enumerate(index[:-1]):
+                flat_index += idx * math.prod(arr.shape[dim+1:])
+            # using index expression as single var for flat array
+            return cp.Element(arr.flatten(), flat_index)
+
+        return super().__getitem__(index)
+
+    """
+    make the given array the first dimension in the returned array
+    """
+    def __axis(self, axis):
+
+        arr = self
+
+        # correct type and value checks
+        if not isinstance(axis,int):
+            raise TypeError("Axis keyword argument in .sum() should always be an integer")
+        if axis >= arr.ndim:
+            raise ValueError("Axis out of range")
+
+        if axis < 0:
+            axis += arr.ndim
+
+        # Change the array to make the selected axis the first dimension
+        if axis > 0:
+            iter_axis = list(range(arr.ndim))
+            iter_axis.remove(axis)
+            iter_axis.insert(0, axis)
+            arr = arr.transpose(iter_axis)
+
+        return arr
 
     def sum(self, axis=None, out=None):
         """
             overwrite np.sum(NDVarArray) as people might use it
-
-            does not actually support axis/out... todo?
         """
-        if not axis is None or not out is None:
-            raise NotImplementedError() # please report on github with usecase
 
-        # return sum object over all dimensions
-        return Operator("sum", self.flat)
+        if out is not None:
+            raise NotImplementedError()
+
+        if axis is None:    # simple case where we want the sum over the whole array
+            return cp.sum(self)
+
+        return cpm_array(np.apply_along_axis(cp.sum, axis=axis, arr=self))
+
+
+    def prod(self, axis=None, out=None):
+        """
+            overwrite np.prod(NDVarArray) as people might use it
+        """
+
+        if out is not None:
+            raise NotImplementedError()
+
+        if axis is None:  # simple case where we want the product over the whole array
+            return reduce(lambda a, b: a * b, self.flatten())
+
+        # TODO: is there a better way? This does pairwise multiplication still
+        return cpm_array(np.multiply.reduce(self, axis=axis))
+
+    def max(self, axis=None, out=None):
+        """
+            overwrite np.max(NDVarArray) as people might use it
+        """
+        if out is not None:
+            raise NotImplementedError()
+
+        if axis is None:    # simple case where we want the maximum over the whole array
+            return cp.max(self)
+
+        return cpm_array(np.apply_along_axis(cp.max, axis=axis, arr=self))
+
+    def min(self, axis=None, out=None):
+        """
+            overwrite np.min(NDVarArray) as people might use it
+        """
+        if out is not None:
+            raise NotImplementedError()
+
+        if axis is None:    # simple case where we want the minimum over the whole array
+            return cp.min(self)
+
+        return cpm_array(np.apply_along_axis(cp.min, axis=axis, arr=self))
+
+    def any(self, axis=None, out=None):
+        """
+            overwrite np.any(NDVarArray)
+        """
+        if any(not is_boolexpr(x) for x in self.flat):
+            raise TypeError("Cannot call .any() in an array not consisting only of bools")
+
+        if out is not None:
+            raise NotImplementedError()
+
+        if axis is None:    # simple case where we want a disjunction over the whole array
+            return cp.any(self)
+
+        return cpm_array(np.apply_along_axis(cp.any, axis=axis, arr=self))
+
+
+    def all(self, axis=None, out=None):
+        """
+            overwrite np.any(NDVarArray)
+        """
+        if any(not is_boolexpr(x) for x in self.flat):
+            raise TypeError("Cannot call .any() in an array not consisting only of bools")
+
+        if out is not None:
+            raise NotImplementedError()
+
+        if axis is None:  # simple case where we want a conjunction over the whole array
+            return cp.all(self)
+
+        return cpm_array(np.apply_along_axis(cp.all, axis=axis, arr=self))
+
+    def get_bounds(self):
+        lbs, ubs = zip(*[get_bounds(e) for e in self])
+        return cpm_array(lbs), cpm_array(ubs)
 
     # VECTORIZED master function (delegate)
     def _vectorized(self, other, attr):
@@ -462,71 +609,103 @@ class NDVarArray(Expression, np.ndarray):
         # this is a bit cryptic, but it calls 'attr' on s with o as arg
         # s.__eq__(o) <-> getattr(s, '__eq__')(o)
         return cpm_array([getattr(s,attr)(o) for s,o in zip(self, other)])
-        
+
     # VECTORIZED comparisons
     def __eq__(self, other):
-        return self._vectorized(other, '__eq__') 
+        return self._vectorized(other, '__eq__')
+
     def __ne__(self, other):
-        return self._vectorized(other, '__ne__') 
+        return self._vectorized(other, '__ne__')
+
     def __lt__(self, other):
-        return self._vectorized(other, '__lt__') 
+        return self._vectorized(other, '__lt__')
+
     def __le__(self, other):
-        return self._vectorized(other, '__le__') 
+        return self._vectorized(other, '__le__')
+
     def __gt__(self, other):
-        return self._vectorized(other, '__gt__') 
+        return self._vectorized(other, '__gt__')
+
     def __ge__(self, other):
-        return self._vectorized(other, '__ge__') 
+        return self._vectorized(other, '__ge__')
 
     # VECTORIZED math operators
     # only 'abs' 'neg' and binary ones
     # '~' not needed, gets translated to ==0 and that is already handled
     def __abs__(self):
         return cpm_array([abs(s) for s in self])
+
     def __neg__(self):
         return cpm_array([-s for s in self])
+
     def __add__(self, other):
-        return self._vectorized(other, '__add__') 
+        return self._vectorized(other, '__add__')
+
     def __radd__(self, other):
-        return self._vectorized(other, '__radd__') 
+        return self._vectorized(other, '__radd__')
+
     def __sub__(self, other):
-        return self._vectorized(other, '__sub__') 
+        return self._vectorized(other, '__sub__')
+
     def __rsub__(self, other):
-        return self._vectorized(other, '__rsub__') 
+        return self._vectorized(other, '__rsub__')
+
     def __mul__(self, other):
-        return self._vectorized(other, '__mul__') 
+        return self._vectorized(other, '__mul__')
+
     def __rmul__(self, other):
-        return self._vectorized(other, '__rmul__') 
+        return self._vectorized(other, '__rmul__')
+
     def __truediv__(self, other):
-        return self._vectorized(other, '__truediv__') 
+        return self._vectorized(other, '__truediv__')
+
     def __rtruediv__(self, other):
-        return self._vectorized(other, '__rtruediv__') 
+        return self._vectorized(other, '__rtruediv__')
+
+    def __floordiv__(self, other):
+        return self._vectorized(other, '__floordiv__')
+
+    def __rfloordiv__(self, other):
+        return self._vectorized(other, '__rfloordiv__')
+
     def __mod__(self, other):
-        return self._vectorized(other, '__mod__') 
+        return self._vectorized(other, '__mod__')
+
     def __rmod__(self, other):
-        return self._vectorized(other, '__rmod__') 
+        return self._vectorized(other, '__rmod__')
+
     def __pow__(self, other, modulo=None):
         assert (modulo is None), "Power operator: modulo not supported"
-        return self._vectorized(other, '__pow__') 
+        return self._vectorized(other, '__pow__')
+
     def __rpow__(self, other, modulo=None):
         assert (modulo is None), "Power operator: modulo not supported"
-        return self._vectorized(other, '__rpow__') 
-    
+        return self._vectorized(other, '__rpow__')
+
     # VECTORIZED Bool operators
-    # __invert__ not needed because translated to == 0 and that is handled properly
+    def __invert__(self):
+        return cpm_array([~s for s in self])
+
     def __and__(self, other):
-        return self._vectorized(other, '__and__') 
+        return self._vectorized(other, '__and__')
+
     def __rand__(self, other):
-        return self._vectorized(other, '__rand__') 
+        return self._vectorized(other, '__rand__')
+
     def __or__(self, other):
-        return self._vectorized(other, '__or__') 
+        return self._vectorized(other, '__or__')
+
     def __ror__(self, other):
-        return self._vectorized(other, '__ror__') 
+        return self._vectorized(other, '__ror__')
+
     def __xor__(self, other):
-        return self._vectorized(other, '__xor__') 
+        return self._vectorized(other, '__xor__')
+
     def __rxor__(self, other):
-        return self._vectorized(other, '__rxor__') 
+        return self._vectorized(other, '__rxor__')
+
     def implies(self, other):
-        return self._vectorized(other, 'implies') 
+        return self._vectorized(other, 'implies')
 
     #in	  __contains__(self, value) 	Check membership
     # CANNOT meaningfully overwrite, python always returns True/False
@@ -535,6 +714,28 @@ class NDVarArray(Expression, np.ndarray):
     # TODO?
     #object.__matmul__(self, other)
 
+
+def _gen_var_names(name, shape):
+    """
+    Helper function to collect the name of all decision variables (in np.ndindex(shape) order)
+
+    `name` can be None, str, or an enumerable with the same shape as `shape`.
+    Raises errors if invalid name
+    """
+    if name is None or isinstance(name, str):
+        return [_genname(name, idx) for idx in np.ndindex(shape)]
+    elif isinstance(name, (list, tuple, np.ndarray)):
+        # special case: should match shape of decision variables
+        name_arr = np.array(name)
+        if isinstance(shape, int):
+            shape = (shape,)
+        if name_arr.shape != shape:
+            raise ValueError(f"The shape of name sequence {name_arr.shape} does not match {shape}.")
+        if len(name_arr.flat) != len(np.unique(name_arr)):
+            raise ValueError(f"Duplicated names in {name_arr}.")
+        return [name_arr[idx] for idx in np.ndindex(shape)]
+    else:
+        raise TypeError(f"Unsupported type for name: {type(name)}")
 
 def _genname(basename, idxs):
     """
@@ -548,6 +749,6 @@ def _genname(basename, idxs):
     """
     if basename == None:
         return None
-    stridxs = ",".join(map(str,idxs))
+    stridxs = ",".join(map(str, idxs))
     return f"{basename}[{stridxs}]" # "<name>[<idx0>,<idx1>,...]"
-    
+
